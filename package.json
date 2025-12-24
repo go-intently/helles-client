@@ -37,11 +37,11 @@
     "observability",
     "logging"
   ],
-  "author": "",
+  "author": "Intently (go@intently.gg)",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/yourusername/helles-client.git"
+    "url": "https://github.com/go-intently/helles-client.git"
   },
   "engines": {
     "node": ">=18.0.0"
