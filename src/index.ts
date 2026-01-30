@@ -42,6 +42,7 @@ export type TraceFlowItem = {
   type?: string | null;
   chainid?: number | string | null;
   asset_label?: string | null;
+  asset_decimals?: number | null;
   estimated?: {
     units?: number | string | null;
     raw?: number | string | null;
@@ -78,6 +79,7 @@ function traceFlowItemToServerRow(item: TraceFlowItem): Record<string, unknown> 
     flow_type: item.type,
     flow_chainid: item.chainid,
     flow_asset_label: item.asset_label,
+    flow_asset_decimals: item.asset_decimals,
     flow_units_estimated: e?.units,
     flow_raw_estimated: e?.raw,
     flow_usd_estimated: e?.usd,
@@ -401,6 +403,7 @@ export class HellesClient {
    * @param params.items[].type - Optional type/category of the flow.
    * @param params.items[].chainid - Optional chain identifier.
    * @param params.items[].asset_label - Optional asset label.
+   * @param params.items[].asset_decimals - Optional asset decimals (integer).
    * @param params.items[].estimated - Optional object: units, raw, usd, unitsapprox, timestamp.
    * @param params.items[].actual - Optional object: units, raw, usd, unitsapprox, timestamp, hash, entity.
    * @param params.onError - Optional error handler for this call.
