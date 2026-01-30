@@ -30,6 +30,62 @@ type TimeSyncState = {
   nextIntervalMs: number;
 };
 
+/**
+ * One row for the trace-flows upsert endpoint. tracekey and flow_key are required;
+ * other fields are optional. estimated/actual are nested; top-level fields have no "flow_" prefix.
+ */
+export type TraceFlowItem = {
+  tracekey: string;
+  flow_key: string;
+  idempotency?: number;
+  order?: number | null;
+  type?: string | null;
+  chainid?: string | null;
+  asset_label?: string | null;
+  estimated?: {
+    units?: number | string | null;
+    raw?: number | string | null;
+    usd?: number | string | null;
+    unitsapprox?: number | string | null;
+    timestamp?: number | null;
+  } | null;
+  actual?: {
+    units?: number | string | null;
+    raw?: number | string | null;
+    usd?: number | string | null;
+    unitsapprox?: number | string | null;
+    timestamp?: number | null;
+    hash?: string | null;
+    entity?: string | null;
+  } | null;
+};
+
+function traceFlowItemToServerRow(item: TraceFlowItem): Record<string, unknown> {
+  const e = item.estimated;
+  const a = item.actual;
+  return {
+    tracekey: item.tracekey,
+    flow_key: item.flow_key,
+    idempotency: item.idempotency,
+    flow_order: item.order,
+    flow_type: item.type,
+    flow_chainid: item.chainid,
+    flow_asset_label: item.asset_label,
+    flow_units_estimated: e?.units,
+    flow_raw_estimated: e?.raw,
+    flow_usd_estimated: e?.usd,
+    flow_unitsapprox_estimated: e?.unitsapprox,
+    flow_timestamp_estimated: e?.timestamp,
+    flow_units_actual: a?.units,
+    flow_raw_actual: a?.raw,
+    flow_usd_actual: a?.usd,
+    flow_unitsapprox_actual: a?.unitsapprox,
+    flow_timestamp_actual: a?.timestamp,
+    flow_hash_actual: a?.hash,
+    flow_entity_actual: a?.entity
+  };
+}
+
 const BASE_SYNC_INTERVAL_MS = 30_000;
 const BACKOFF_STEP_MS = 15_000;
 const MAX_SYNC_INTERVAL_MS = 180_000;
@@ -313,6 +369,75 @@ export class HellesClient {
       }
     } catch (error: any) {
       // if a custom error handler is provided, use it. otherwise rethrow plain
+      if (onError) {
+        onError(error);
+      } else if (this.defaults?.onError) {
+        this.defaults.onError(error);
+      } else {
+        throw error;
+      }
+    }
+  }
+
+  /**
+   * Upserts trace flow rows for one or more traces. Sends items to the Helles trace-flows upsert endpoint.
+   * Each item must have tracekey and flow_key; tracekey is normalized to uppercase. Items with missing
+   * tracekey or flow_key are skipped (counted in response.skipped). Optional idempotency values allow
+   * the server to ignore older duplicates.
+   *
+   * @param params - Upsert parameters
+   * @param params.items - Array of trace flow items to upsert. Each item must include tracekey and flow_key; other fields are optional. Use order, type, chainid, asset_label at top level; estimated and actual in nested objects.
+   * @param params.items[].tracekey - Trace key (required). Normalized to uppercase on the server.
+   * @param params.items[].flow_key - Flow key (required). Unique per trace.
+   * @param params.items[].idempotency - Optional numeric idempotency value; lower values for the same (tracekey, flow_key) are ignored.
+   * @param params.items[].order - Optional order of the flow within the trace.
+   * @param params.items[].type - Optional type/category of the flow.
+   * @param params.items[].chainid - Optional chain identifier.
+   * @param params.items[].asset_label - Optional asset label.
+   * @param params.items[].estimated - Optional object: units, raw, usd, unitsapprox, timestamp.
+   * @param params.items[].actual - Optional object: units, raw, usd, unitsapprox, timestamp, hash, entity.
+   * @param params.onError - Optional error handler for this call.
+   * @returns The response from the Helles server: { accepted: number, skipped: number }, or undefined if onError handled the error.
+   */
+  async upsertTraceFlows({
+    items,
+    onError
+  }: {
+    items: TraceFlowItem[];
+    onError?: (error: any) => void;
+  }): Promise<{ accepted: number; skipped: number } | undefined> {
+    try {
+      if (!Array.isArray(items) || items.length === 0) {
+        throw new Error('items array is required and must be non-empty');
+      }
+
+      const payload = items.map((item) => {
+        const rawTraceKey = item.tracekey != null ? String(item.tracekey) : null;
+        const tracekey = rawTraceKey ? this.applyTraceSuffix(rawTraceKey).toUpperCase() : null;
+        const flow_key = item.flow_key != null ? String(item.flow_key) : null;
+        const row = traceFlowItemToServerRow(item);
+        return { ...row, tracekey, flow_key };
+      });
+
+      const response = await request(`${this.hellesHost}/trace-flows/upsert`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: wf_stringify({ items: payload })
+      });
+
+      if (response.statusCode >= 400) {
+        const errorBody: any = await response.body.json().catch(() => ({}));
+        if (typeof errorBody?.error === 'string') {
+          throw new Error(`upsertTraceFlows err: ${errorBody.error}`);
+        } else {
+          const errorDetails = errorBody ? wf_stringify(errorBody) : `HTTP ${response.statusCode}`;
+          throw new Error(`upsertTraceFlows err: ${errorDetails}`);
+        }
+      }
+
+      const result = (await response.body.json()) as { accepted: number; skipped: number };
+      return result;
+    } catch (error: any) {
       if (onError) {
         onError(error);
       } else if (this.defaults?.onError) {
