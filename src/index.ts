@@ -40,7 +40,7 @@ export type TraceFlowItem = {
   idempotency?: number;
   order?: number | null;
   type?: string | null;
-  chainid?: string | null;
+  chainid?: number | string | null;
   asset_label?: string | null;
   estimated?: {
     units?: number | string | null;
@@ -60,27 +60,34 @@ export type TraceFlowItem = {
   } | null;
 };
 
+function floorIfNumber(v: unknown): unknown {
+  if (typeof v === 'number' && !Number.isInteger(v)) {
+    return Math.floor(v);
+  }
+  return v;
+}
+
 function traceFlowItemToServerRow(item: TraceFlowItem): Record<string, unknown> {
   const e = item.estimated;
   const a = item.actual;
   return {
     tracekey: item.tracekey,
     flow_key: item.flow_key,
-    idempotency: item.idempotency,
-    flow_order: item.order,
+    idempotency: floorIfNumber(item.idempotency),
+    flow_order: floorIfNumber(item.order),
     flow_type: item.type,
     flow_chainid: item.chainid,
     flow_asset_label: item.asset_label,
-    flow_units_estimated: e?.units,
-    flow_raw_estimated: e?.raw,
-    flow_usd_estimated: e?.usd,
-    flow_unitsapprox_estimated: e?.unitsapprox,
-    flow_timestamp_estimated: e?.timestamp,
-    flow_units_actual: a?.units,
-    flow_raw_actual: a?.raw,
-    flow_usd_actual: a?.usd,
-    flow_unitsapprox_actual: a?.unitsapprox,
-    flow_timestamp_actual: a?.timestamp,
+    flow_units_estimated: floorIfNumber(e?.units),
+    flow_raw_estimated: floorIfNumber(e?.raw),
+    flow_usd_estimated: floorIfNumber(e?.usd),
+    flow_unitsapprox_estimated: floorIfNumber(e?.unitsapprox),
+    flow_timestamp_estimated: floorIfNumber(e?.timestamp),
+    flow_units_actual: floorIfNumber(a?.units),
+    flow_raw_actual: floorIfNumber(a?.raw),
+    flow_usd_actual: floorIfNumber(a?.usd),
+    flow_unitsapprox_actual: floorIfNumber(a?.unitsapprox),
+    flow_timestamp_actual: floorIfNumber(a?.timestamp),
     flow_hash_actual: a?.hash,
     flow_entity_actual: a?.entity
   };
