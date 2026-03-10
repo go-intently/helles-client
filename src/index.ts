@@ -260,6 +260,7 @@ export class HellesClient {
    * @param params.eventUniquer - Optional unique identifier for event deduplication (IE: You can send multiple times & it wont dupe)
    * @param params.eventTypeLabel - Optional overriding human-readable label for the event type EG: "Note" becomes "Alert"
    * @param params.eventTypeIcon - Optional overriding icon for the event type EG: "🎯"
+   * @param params.eventPermission - Optional permission identifier for this event
    * @param params.onError - Optional error handler function
    * @returns The response data from the Helles server
    */
@@ -273,6 +274,7 @@ export class HellesClient {
     eventUniquer,
     eventTypeIcon,
     eventTypeLabel,
+    eventPermission,
     onError
   }: {
     traceKey: string;
@@ -284,6 +286,7 @@ export class HellesClient {
     eventUniquer?: string;
     eventTypeLabel?: string;
     eventTypeIcon?: string;
+    eventPermission?: string;
     onError?: (error: any) => void;
   }): Promise<any> {
     try {
@@ -349,6 +352,10 @@ export class HellesClient {
         eventTimestampUtc: _eventTimestampUtc,
         eventUniquer
       };
+
+      if (eventPermission !== undefined) {
+        postPayload.permission = eventPermission;
+      }
 
       try {
         const response = await request(`${this.hellesHost}/events`, {
