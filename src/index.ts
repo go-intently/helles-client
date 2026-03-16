@@ -30,6 +30,20 @@ type TimeSyncState = {
   nextIntervalMs: number;
 };
 
+export type HellesErrorContext = {
+  operation: 'logTraceEvent' | 'upsertTraceFlows' | 'deleteTrace';
+  stage?: string;
+  endpoint?: string;
+  statusCode?: number;
+  params?: Record<string, unknown>;
+};
+
+export type HellesError = Error & {
+  hellesContext?: HellesErrorContext;
+};
+
+export type HellesErrorHandler = (error: HellesError, context?: HellesErrorContext) => void;
+
 /**
  * One row for the trace-flows upsert endpoint. tracekey and flow_key are required;
  * other fields are optional. estimated/actual are nested; top-level fields have no "flow_" prefix.
@@ -110,7 +124,7 @@ export class HellesClient {
     sender?: string;
     traceType?: string;
     eventTimestampFunc?: () => number;
-    onError?: (error: any) => void;
+    onError?: HellesErrorHandler;
     traceSuffix?: string;
   };
   private registeredTraces: Set<string> = new Set();
@@ -140,7 +154,7 @@ export class HellesClient {
       sender?: string;
       traceType?: string;
       eventTimestampFunc?: () => number;
-      onError?: (error: any) => void;
+      onError?: HellesErrorHandler;
       traceSuffix?: string;
     };
   }) {
@@ -248,6 +262,27 @@ export class HellesClient {
   }
 
   /**
+   * Dispatches operation errors to local/global handlers with optional context.
+   * If no handler exists, the error is rethrown.
+   */
+  private dispatchError(error: unknown, onError?: HellesErrorHandler, context?: HellesErrorContext): never | void {
+    const normalized: HellesError =
+      error instanceof Error ? (error as HellesError) : (new Error(String(error)) as HellesError);
+
+    if (context) {
+      normalized.hellesContext = context;
+    }
+
+    const handler = onError ?? this.defaults?.onError;
+    if (handler) {
+      handler(normalized, context);
+      return;
+    }
+
+    throw normalized;
+  }
+
+  /**
    * Logs an event to a trace. Automatically registers the trace if it hasn't been registered yet.
    * The trace key will have the configured trace suffix appended automatically.
    * @param params - Event parameters
@@ -261,7 +296,7 @@ export class HellesClient {
    * @param params.eventTypeLabel - Optional overriding human-readable label for the event type EG: "Note" becomes "Alert"
    * @param params.eventTypeIcon - Optional overriding icon for the event type EG: "🎯"
    * @param params.eventPermission - Optional permission identifier for this event
-   * @param params.onError - Optional error handler function
+   * @param params.onError - Optional error handler function: (error, context) => void
    * @returns The response data from the Helles server
    */
   async logTraceEvent({
@@ -287,16 +322,23 @@ export class HellesClient {
     eventTypeLabel?: string;
     eventTypeIcon?: string;
     eventPermission?: string;
-    onError?: (error: any) => void;
+    onError?: HellesErrorHandler;
   }): Promise<any> {
+    let failedStage = 'validate';
+    const _traceKey = this.applyTraceSuffix(traceKey);
+    let _eventTimestampUtc: number | undefined;
+    let _eventSender: string | undefined;
+
     try {
-      const _traceKey = this.applyTraceSuffix(traceKey);
       if (eventTypeLabel) eventAttributes.eventTypeLabel = eventTypeLabel;
       if (eventTypeIcon) eventAttributes.eventTypeIcon = eventTypeIcon;
 
-      const defaultTimestamp = this.defaults!.eventTimestampFunc?.() ?? this.now();
-      const _eventTimestampUtc =
+      const defaultTimestamp = this.defaults?.eventTimestampFunc?.() ?? this.now();
+      _eventTimestampUtc =
         eventTimestampUtc !== undefined ? eventTimestampUtc : defaultTimestamp;
+      if (_eventTimestampUtc === undefined) {
+        throw new Error('eventTimestampUtc could not be resolved');
+      }
 
       if (
         _eventTimestampUtc > 2565000000000 ||
@@ -307,13 +349,14 @@ export class HellesClient {
         );
       }
 
-      const _eventSender = eventSender || this.defaults!.sender;
+      _eventSender = eventSender || this.defaults?.sender;
       if (_eventSender == undefined) {
         throw new Error(`eventSender is required`);
       }
 
       // only register trace if it hasn't been registered yet
       if (!this.registeredTraces.has(_traceKey)) {
+        failedStage = 'registerTrace';
         try {
           const registerPayload = {
             traceKey: _traceKey,
@@ -343,6 +386,7 @@ export class HellesClient {
         this.registeredTraces.add(_traceKey);
       }
 
+      failedStage = 'postEvent';
       const postPayload: any = {
         traceKey: _traceKey,
         eventTypeKey: eventType,
@@ -384,14 +428,33 @@ export class HellesClient {
         }
       }
     } catch (error: any) {
-      // if a custom error handler is provided, use it. otherwise rethrow plain
-      if (onError) {
-        onError(error);
-      } else if (this.defaults?.onError) {
-        this.defaults.onError(error);
-      } else {
-        throw error;
-      }
+      this.dispatchError(error, onError, {
+        operation: 'logTraceEvent',
+        stage: failedStage,
+        endpoint: failedStage === 'registerTrace'
+          ? '/traces'
+          : failedStage === 'postEvent'
+            ? '/events'
+            : undefined,
+        params: {
+          traceKey,
+          resolvedTraceKey: _traceKey,
+          eventType,
+          eventString,
+          eventSender,
+          resolvedEventSender: _eventSender,
+          eventTimestampUtc,
+          resolvedEventTimestampUtc: _eventTimestampUtc,
+          eventUniquer,
+          eventTypeLabel,
+          eventTypeIcon,
+          eventPermission,
+          eventAttributesKeys:
+            eventAttributes && typeof eventAttributes === 'object'
+              ? Object.keys(eventAttributes)
+              : []
+        }
+      });
     }
   }
 
@@ -413,7 +476,7 @@ export class HellesClient {
    * @param params.items[].asset_decimals - Optional asset decimals (integer).
    * @param params.items[].estimated - Optional object: units, raw, usd, unitsapprox, timestamp.
    * @param params.items[].actual - Optional object: units, raw, usd, unitsapprox, timestamp, hash, entity.
-   * @param params.onError - Optional error handler for this call.
+   * @param params.onError - Optional error handler for this call: (error, context) => void
    * @returns The response from the Helles server: { accepted: number, skipped: number }, or undefined if onError handled the error.
    */
   async upsertTraceFlows({
@@ -421,13 +484,15 @@ export class HellesClient {
     onError
   }: {
     items: TraceFlowItem[];
-    onError?: (error: any) => void;
+    onError?: HellesErrorHandler;
   }): Promise<{ accepted: number; skipped: number } | undefined> {
+    let failedStage = 'validate';
     try {
       if (!Array.isArray(items) || items.length === 0) {
         throw new Error('items array is required and must be non-empty');
       }
 
+      failedStage = 'postUpsert';
       const payload = items.map((item) => {
         const rawTraceKey = item.tracekey != null ? String(item.tracekey) : null;
         const tracekey = rawTraceKey ? this.applyTraceSuffix(rawTraceKey).toUpperCase() : null;
@@ -455,13 +520,17 @@ export class HellesClient {
       const result = (await response.body.json()) as { accepted: number; skipped: number };
       return result;
     } catch (error: any) {
-      if (onError) {
-        onError(error);
-      } else if (this.defaults?.onError) {
-        this.defaults.onError(error);
-      } else {
-        throw error;
-      }
+      this.dispatchError(error, onError, {
+        operation: 'upsertTraceFlows',
+        stage: failedStage,
+        endpoint: '/api/trace-flows/upsert',
+        params: {
+          itemsCount: Array.isArray(items) ? items.length : 0,
+          sample: Array.isArray(items) && items[0]
+            ? { tracekey: items[0].tracekey, flow_key: items[0].flow_key }
+            : null
+        }
+      });
     }
   }
 
@@ -471,7 +540,7 @@ export class HellesClient {
    * Requires an API key to be configured in the constructor.
    * @param params - Delete parameters
    * @param params.traceKey - The trace key to delete
-   * @param params.onError - Optional error handler for this specific operation
+   * @param params.onError - Optional error handler for this specific operation: (error, context) => void
    * @returns The response data from the Helles server
    */
   async deleteTrace({
@@ -479,8 +548,12 @@ export class HellesClient {
     onError
   }: {
     traceKey: string;
-    onError?: (error: any) => void;
+    onError?: HellesErrorHandler;
   }): Promise<any> {
+    let failedStage = 'validate';
+    const _traceKey = this.applyTraceSuffix(traceKey);
+    const normalizedTraceKey = _traceKey.toUpperCase();
+
     try {
       if (!this.apiKey) {
         throw new Error('API key is required for deleteTrace');
@@ -490,10 +563,8 @@ export class HellesClient {
         throw new Error('traceKey is required');
       }
 
-      const _traceKey = this.applyTraceSuffix(traceKey);
-      const normalizedTraceKey = _traceKey.toUpperCase();
-
       try {
+        failedStage = 'postDelete';
         const deletePayload = {
           apiKey: this.apiKey,
           traceKey: normalizedTraceKey
@@ -529,13 +600,17 @@ export class HellesClient {
         }
       }
     } catch (error: any) {
-      if (onError) {
-        onError(error);
-      } else if (this.defaults?.onError) {
-        this.defaults.onError(error);
-      } else {
-        throw error;
-      }
+      this.dispatchError(error, onError, {
+        operation: 'deleteTrace',
+        stage: failedStage,
+        endpoint: '/traces/delete',
+        params: {
+          traceKey,
+          resolvedTraceKey: _traceKey,
+          normalizedTraceKey,
+          hasApiKey: Boolean(this.apiKey)
+        }
+      });
     }
   }
 }

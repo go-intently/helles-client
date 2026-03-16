@@ -69,7 +69,7 @@ new HellesClient(config: {
     sender?: string;
     traceType?: string;
     eventTimestampFunc?: () => number;
-    onError?: (error: any) => void;
+    onError?: (error: any, context?: HellesErrorContext) => void;
     traceSuffix?: string;
   };
 })
@@ -117,7 +117,7 @@ await client.logTraceEvent({
   eventUniquer?: string;          // Optional: unique ID for deduplication
   eventTypeLabel?: string;        // Optional: Typically only needed for "NOTE" eventTypes - human-readable label (e.g., "Alert")
   eventTypeIcon?: string;         // Optional: Typically only needed for "NOTE" eventTypes - icon (e.g., "🎯")
-  onError?: (error: any) => void; // Optional: error handler for this call
+  onError?: (error: any, context?: HellesErrorContext) => void; // Optional: error handler for this call
 });
 ```
 
@@ -138,7 +138,7 @@ Deletes a trace from the Helles server. Requires special permissions
 ```typescript
 await client.deleteTrace({
   traceKey: string;              // Required: trace identifier
-  onError?: (error: any) => void; // Optional: error handler for this call
+  onError?: (error: any, context?: HellesErrorContext) => void; // Optional: error handler for this call
 });
 ```
 
@@ -149,6 +149,17 @@ The client automatically synchronizes time with the Helles server on startup and
 ## Error Handling
 
 Errors can be handled globally via `defaults.onError` in the constructor, or per-operation via the `onError` parameter in method calls. If no error handler is provided, errors are thrown.
+
+Both handlers receive a second argument with failure context:
+
+```typescript
+onError(error, context) {
+  console.error(error.message);
+  console.error(context?.operation); // "logTraceEvent" | "upsertTraceFlows" | "deleteTrace"
+  console.error(context?.stage);     // e.g. "validate", "registerTrace", "postEvent"
+  console.error(context?.params);    // sanitized call parameters for troubleshooting
+}
+```
 
 ## Trace Suffix
 
