@@ -112,6 +112,8 @@ function traceFlowItemToServerRow(item: TraceFlowItem): Record<string, unknown> 
 const BASE_SYNC_INTERVAL_MS = 30_000;
 const BACKOFF_STEP_MS = 15_000;
 const MAX_SYNC_INTERVAL_MS = 180_000;
+const RETRY_DELAY_MS = 3_000;
+const MAX_NETWORK_ATTEMPTS = 2;
 
 /**
  * Client for interacting with the Helles tracing service.
@@ -134,6 +136,83 @@ export class HellesClient {
     lastCheck: null,
     nextIntervalMs: BASE_SYNC_INTERVAL_MS
   };
+
+  /**
+   * Wraps undici request and installs a body error listener to prevent
+   * unhandled stream errors from crashing the process.
+   */
+  private async requestWithBodyGuard(url: string, options: Parameters<typeof request>[1]) {
+    const response = await request(url, options);
+    response.body?.on?.('error', () => {
+      // Keep process alive for transient socket/body stream errors.
+      // Callers still receive failures via awaited body reads.
+    });
+    return response;
+  }
+
+  /**
+   * Drains an unused response body to avoid dangling stream issues.
+   */
+  private async drainBody(response: Awaited<ReturnType<typeof request>>): Promise<void> {
+    try {
+      await response.body.dump();
+    } catch {
+      // Best-effort cleanup only.
+    }
+  }
+
+  private async sleep(ms: number): Promise<void> {
+    await new Promise<void>((resolve) => setTimeout(resolve, ms));
+  }
+
+  private isRetryableNetworkError(error: any): boolean {
+    const code = error?.code;
+    const message = (error?.message ?? '').toLowerCase();
+
+    if (
+      code === 'UND_ERR_SOCKET' ||
+      code === 'ECONNRESET' ||
+      code === 'ETIMEDOUT' ||
+      code === 'UND_ERR_CONNECT_TIMEOUT' ||
+      code === 'UND_ERR_HEADERS_TIMEOUT' ||
+      code === 'UND_ERR_BODY_TIMEOUT'
+    ) {
+      return true;
+    }
+
+    return (
+      message.includes('other side closed') ||
+      message.includes('socket hang up') ||
+      message.includes('connection reset')
+    );
+  }
+
+  private async runWithSingleRetry<T>(operation: () => Promise<T>): Promise<T> {
+    let lastError: unknown;
+
+    for (let attempt = 1; attempt <= MAX_NETWORK_ATTEMPTS; attempt++) {
+      try {
+        return await operation();
+      } catch (error) {
+        lastError = error;
+        const canRetry =
+          attempt < MAX_NETWORK_ATTEMPTS && this.isRetryableNetworkError(error);
+
+        if (!canRetry) {
+          throw error;
+        }
+
+        console.warn(
+          `HellesClient transient network error, retrying in ${RETRY_DELAY_MS}ms: ${
+            (error as any)?.message ?? String(error)
+          }`
+        );
+        await this.sleep(RETRY_DELAY_MS);
+      }
+    }
+
+    throw lastError;
+  }
 
   /**
    * Creates a new HellesClient instance.
@@ -203,16 +282,22 @@ export class HellesClient {
       const sendTime = Date.now();
 
       try {
-        const response = await request(`${this.hellesHost}/time`, {
-          method: 'GET'
+        const { receiveTime, latency, serverUtcMilliseconds } = await this.runWithSingleRetry(async () => {
+          const response = await this.requestWithBodyGuard(`${this.hellesHost}/time`, {
+            method: 'GET'
+          });
+
+          const receiveTime = Date.now();
+          const rtt = receiveTime - sendTime;
+          const latency = rtt / 2;
+
+          const body = await response.body.json() as { serverUtcMilliseconds?: number };
+          return {
+            receiveTime,
+            latency,
+            serverUtcMilliseconds: body?.serverUtcMilliseconds
+          };
         });
-
-        const receiveTime = Date.now();
-        const rtt = receiveTime - sendTime;
-        const latency = rtt / 2;
-
-        const body = await response.body.json() as { serverUtcMilliseconds?: number };
-        const serverUtcMilliseconds = body?.serverUtcMilliseconds;
 
         if (typeof serverUtcMilliseconds === 'number') {
           const clientTimeAtServer = receiveTime - latency;
@@ -225,17 +310,17 @@ export class HellesClient {
             nextIntervalMs: BASE_SYNC_INTERVAL_MS
           };
         } else {
-          console.warn('HellesClient time sync: invalid /time response payload', body);
+          console.warn(
+            'HellesClient time sync: invalid /time response payload',
+            { serverUtcMilliseconds }
+          );
           this.incrementBackoff();
         }
       } catch (error: any) {
         const message = error?.message ?? String(error);
-        if (isInitial) {
-          throw new Error('Helles startup connection health check failed');
-        } else {
-          console.warn(`HellesClient time sync failed: ${message}`);
-          this.incrementBackoff();
-        }
+        const phase = isInitial ? 'initial' : 'scheduled';
+        console.warn(`HellesClient ${phase} time sync failed: ${message}`);
+        this.incrementBackoff();
       } finally {
         setTimeout(() => {
           void sync(false);
@@ -364,17 +449,21 @@ export class HellesClient {
             traceString: _traceKey
           };
 
-          const response = await request(`${this.hellesHost}/traces`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: wf_stringify(registerPayload)
-          });
+          await this.runWithSingleRetry(async () => {
+            const response = await this.requestWithBodyGuard(`${this.hellesHost}/traces`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: wf_stringify(registerPayload)
+            });
 
-          if (response.statusCode >= 400) {
-            const errorBody = await response.body.json().catch(() => ({}));
-            const errorDetails = errorBody ? wf_stringify(errorBody) : `HTTP ${response.statusCode}`;
-            throw new Error(`registerTrace err: ${errorDetails}`);
-          }
+            if (response.statusCode >= 400) {
+              const errorBody = await response.body.json().catch(() => ({}));
+              const errorDetails = errorBody ? wf_stringify(errorBody) : `HTTP ${response.statusCode}`;
+              throw new Error(`registerTrace err: ${errorDetails}`);
+            }
+
+            await this.drainBody(response);
+          });
         } catch (error: any) {
           if (error.message?.includes('registerTrace err:')) {
             throw error;
@@ -402,23 +491,25 @@ export class HellesClient {
       }
 
       try {
-        const response = await request(`${this.hellesHost}/events`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: wf_stringify(postPayload)
-        });
+        return await this.runWithSingleRetry(async () => {
+          const response = await this.requestWithBodyGuard(`${this.hellesHost}/events`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: wf_stringify(postPayload)
+          });
 
-        if (response.statusCode >= 400) {
-          const errorBody: any = await response.body.json().catch(() => ({}));
-          if (typeof errorBody?.error === 'string') {
-            throw new Error(`logTraceEvent err: ${errorBody.error}`);
-          } else {
-            const errorDetails = errorBody ? wf_stringify(errorBody) : `HTTP ${response.statusCode}`;
-            throw new Error(`logTraceEvent err: ${errorDetails}`);
+          if (response.statusCode >= 400) {
+            const errorBody: any = await response.body.json().catch(() => ({}));
+            if (typeof errorBody?.error === 'string') {
+              throw new Error(`logTraceEvent err: ${errorBody.error}`);
+            } else {
+              const errorDetails = errorBody ? wf_stringify(errorBody) : `HTTP ${response.statusCode}`;
+              throw new Error(`logTraceEvent err: ${errorDetails}`);
+            }
           }
-        }
 
-        return await response.body.json();
+          return await response.body.json();
+        });
       } catch (error: any) {
         if (typeof error?.error === 'string') {
           throw new Error(`logTraceEvent err: ${error.error}`);
@@ -501,24 +592,26 @@ export class HellesClient {
         return { ...row, tracekey, flow_key };
       });
 
-      const response = await request(`${this.hellesHost}/api/trace-flows/upsert`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: wf_stringify({ items: payload })
-      });
+      return await this.runWithSingleRetry(async () => {
+        const response = await this.requestWithBodyGuard(`${this.hellesHost}/api/trace-flows/upsert`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: wf_stringify({ items: payload })
+        });
 
-      if (response.statusCode >= 400) {
-        const errorBody: any = await response.body.json().catch(() => ({}));
-        if (typeof errorBody?.error === 'string') {
-          throw new Error(`upsertTraceFlows err: ${errorBody.error}`);
-        } else {
-          const errorDetails = errorBody ? wf_stringify(errorBody) : `HTTP ${response.statusCode}`;
-          throw new Error(`upsertTraceFlows err: ${errorDetails}`);
+        if (response.statusCode >= 400) {
+          const errorBody: any = await response.body.json().catch(() => ({}));
+          if (typeof errorBody?.error === 'string') {
+            throw new Error(`upsertTraceFlows err: ${errorBody.error}`);
+          } else {
+            const errorDetails = errorBody ? wf_stringify(errorBody) : `HTTP ${response.statusCode}`;
+            throw new Error(`upsertTraceFlows err: ${errorDetails}`);
+          }
         }
-      }
 
-      const result = (await response.body.json()) as { accepted: number; skipped: number };
-      return result;
+        const result = (await response.body.json()) as { accepted: number; skipped: number };
+        return result;
+      });
     } catch (error: any) {
       this.dispatchError(error, onError, {
         operation: 'upsertTraceFlows',
@@ -570,27 +663,29 @@ export class HellesClient {
           traceKey: normalizedTraceKey
         };
 
-        const response = await request(`${this.hellesHost}/traces/delete`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: wf_stringify(deletePayload)
-        });
+        return await this.runWithSingleRetry(async () => {
+          const response = await this.requestWithBodyGuard(`${this.hellesHost}/traces/delete`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: wf_stringify(deletePayload)
+          });
 
-        if (response.statusCode >= 400) {
-          const errorBody: any = await response.body.json().catch(() => ({}));
-          if (typeof errorBody?.error === 'string') {
-            throw new Error(`deleteTrace err: ${errorBody.error}`);
-          } else {
-            const errorDetails = errorBody ? wf_stringify(errorBody) : `HTTP ${response.statusCode}`;
-            throw new Error(`deleteTrace err: ${errorDetails}`);
+          if (response.statusCode >= 400) {
+            const errorBody: any = await response.body.json().catch(() => ({}));
+            if (typeof errorBody?.error === 'string') {
+              throw new Error(`deleteTrace err: ${errorBody.error}`);
+            } else {
+              const errorDetails = errorBody ? wf_stringify(errorBody) : `HTTP ${response.statusCode}`;
+              throw new Error(`deleteTrace err: ${errorDetails}`);
+            }
           }
-        }
 
-        if (this.registeredTraces.has(normalizedTraceKey)) {
-          this.registeredTraces.delete(normalizedTraceKey);
-        }
+          if (this.registeredTraces.has(normalizedTraceKey)) {
+            this.registeredTraces.delete(normalizedTraceKey);
+          }
 
-        return await response.body.json();
+          return await response.body.json();
+        });
       } catch (error: any) {
         if (typeof error?.error === 'string') {
           throw new Error(`deleteTrace err: ${error.error}`);
