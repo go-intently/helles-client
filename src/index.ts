@@ -30,8 +30,14 @@ type TimeSyncState = {
   nextIntervalMs: number;
 };
 
+export type TraceShareResult = {
+  traceKey: string;
+  shareKey: string;
+  shareUrl: string;
+};
+
 export type HellesErrorContext = {
-  operation: 'logTraceEvent' | 'upsertTraceFlows' | 'deleteTrace';
+  operation: 'logTraceEvent' | 'upsertTraceFlows' | 'deleteTrace' | 'traceShare';
   stage?: string;
   endpoint?: string;
   statusCode?: number;
@@ -74,6 +80,22 @@ export type TraceFlowItem = {
     entity?: string | null;
   } | null;
 };
+
+function formatHellesOpError(
+  operation: string,
+  err: string,
+  context?: { type?: string; key?: string }
+): string {
+  const parts: string[] = [operation];
+  if (context?.type != null && context.type !== '') {
+    parts.push(`type=${context.type}`);
+  }
+  if (context?.key != null && context.key !== '') {
+    parts.push(`key=${context.key}`);
+  }
+  parts.push(`err=${err}`);
+  return parts.join(', ');
+}
 
 function normalizeTimestamp(v: unknown): unknown {
   if (v == null) return v;
@@ -421,8 +443,11 @@ export class HellesClient {
       const defaultTimestamp = this.defaults?.eventTimestampFunc?.() ?? this.now();
       _eventTimestampUtc =
         eventTimestampUtc !== undefined ? eventTimestampUtc : defaultTimestamp;
+      const logEventError = (err: string) =>
+        formatHellesOpError('logTraceEvent', err, { type: eventType, key: _traceKey });
+
       if (_eventTimestampUtc === undefined) {
-        throw new Error('eventTimestampUtc could not be resolved');
+        throw new Error(logEventError('eventTimestampUtc could not be resolved'));
       }
 
       if (
@@ -430,13 +455,15 @@ export class HellesClient {
         _eventTimestampUtc < 1665000000000
       ) {
         throw new Error(
-          `eventTimestampUtc value ${_eventTimestampUtc} is out of range - expected Unix millisecond timestamp`
+          logEventError(
+            `eventTimestampUtc value ${_eventTimestampUtc} is out of range - expected Unix millisecond timestamp`
+          )
         );
       }
 
       _eventSender = eventSender || this.defaults?.sender;
       if (_eventSender == undefined) {
-        throw new Error(`eventSender is required`);
+        throw new Error(logEventError('eventSender is required'));
       }
 
       // only register trace if it hasn't been registered yet
@@ -459,17 +486,21 @@ export class HellesClient {
             if (response.statusCode >= 400) {
               const errorBody = await response.body.json().catch(() => ({}));
               const errorDetails = errorBody ? wf_stringify(errorBody) : `HTTP ${response.statusCode}`;
-              throw new Error(`registerTrace err: ${errorDetails}`);
+              throw new Error(
+                formatHellesOpError('registerTrace', errorDetails, { type: eventType, key: _traceKey })
+              );
             }
 
             await this.drainBody(response);
           });
         } catch (error: any) {
-          if (error.message?.includes('registerTrace err:')) {
+          if (error.message?.startsWith('registerTrace ')) {
             throw error;
           }
           const errorDetails = error.message || String(error);
-          throw new Error(`registerTrace err: ${errorDetails}`);
+          throw new Error(
+            formatHellesOpError('registerTrace', errorDetails, { type: eventType, key: _traceKey })
+          );
         }
 
         this.registeredTraces.add(_traceKey);
@@ -501,21 +532,24 @@ export class HellesClient {
           if (response.statusCode >= 400) {
             const errorBody: any = await response.body.json().catch(() => ({}));
             if (typeof errorBody?.error === 'string') {
-              throw new Error(`logTraceEvent err: ${errorBody.error}`);
+              throw new Error(logEventError(errorBody.error));
             } else {
               const errorDetails = errorBody ? wf_stringify(errorBody) : `HTTP ${response.statusCode}`;
-              throw new Error(`logTraceEvent err: ${errorDetails}`);
+              throw new Error(logEventError(errorDetails));
             }
           }
 
           return await response.body.json();
         });
       } catch (error: any) {
+        if (error.message?.startsWith('logTraceEvent ')) {
+          throw error;
+        }
         if (typeof error?.error === 'string') {
-          throw new Error(`logTraceEvent err: ${error.error}`);
+          throw new Error(logEventError(error.error));
         } else {
           const errorDetails = error.message || String(error);
-          throw new Error(`logTraceEvent err: ${errorDetails}`);
+          throw new Error(logEventError(errorDetails));
         }
       }
     } catch (error: any) {
@@ -591,6 +625,16 @@ export class HellesClient {
         const row = traceFlowItemToServerRow(item);
         return { ...row, tracekey, flow_key };
       });
+      const upsertTraceKeys = [
+        ...new Set(
+          payload
+            .map((row) => row.tracekey)
+            .filter((tracekey): tracekey is string => tracekey != null && tracekey !== '')
+        )
+      ].join(',');
+
+      const upsertFlowError = (err: string) =>
+        formatHellesOpError('upsertTraceFlows', err, { key: upsertTraceKeys || undefined });
 
       return await this.runWithSingleRetry(async () => {
         const response = await this.requestWithBodyGuard(`${this.hellesHost}/api/trace-flows/upsert`, {
@@ -602,10 +646,10 @@ export class HellesClient {
         if (response.statusCode >= 400) {
           const errorBody: any = await response.body.json().catch(() => ({}));
           if (typeof errorBody?.error === 'string') {
-            throw new Error(`upsertTraceFlows err: ${errorBody.error}`);
+            throw new Error(upsertFlowError(errorBody.error));
           } else {
             const errorDetails = errorBody ? wf_stringify(errorBody) : `HTTP ${response.statusCode}`;
-            throw new Error(`upsertTraceFlows err: ${errorDetails}`);
+            throw new Error(upsertFlowError(errorDetails));
           }
         }
 
@@ -647,13 +691,16 @@ export class HellesClient {
     const _traceKey = this.applyTraceSuffix(traceKey);
     const normalizedTraceKey = _traceKey.toUpperCase();
 
+    const deleteTraceError = (err: string) =>
+      formatHellesOpError('deleteTrace', err, { key: normalizedTraceKey });
+
     try {
       if (!this.apiKey) {
-        throw new Error('API key is required for deleteTrace');
+        throw new Error(deleteTraceError('API key is required for deleteTrace'));
       }
 
       if (!traceKey) {
-        throw new Error('traceKey is required');
+        throw new Error(deleteTraceError('traceKey is required'));
       }
 
       try {
@@ -673,10 +720,10 @@ export class HellesClient {
           if (response.statusCode >= 400) {
             const errorBody: any = await response.body.json().catch(() => ({}));
             if (typeof errorBody?.error === 'string') {
-              throw new Error(`deleteTrace err: ${errorBody.error}`);
+              throw new Error(deleteTraceError(errorBody.error));
             } else {
               const errorDetails = errorBody ? wf_stringify(errorBody) : `HTTP ${response.statusCode}`;
-              throw new Error(`deleteTrace err: ${errorDetails}`);
+              throw new Error(deleteTraceError(errorDetails));
             }
           }
 
@@ -687,11 +734,14 @@ export class HellesClient {
           return await response.body.json();
         });
       } catch (error: any) {
+        if (error.message?.startsWith('deleteTrace ')) {
+          throw error;
+        }
         if (typeof error?.error === 'string') {
-          throw new Error(`deleteTrace err: ${error.error}`);
+          throw new Error(deleteTraceError(error.error));
         } else {
           const errorDetails = error.message || String(error);
-          throw new Error(`deleteTrace err: ${errorDetails}`);
+          throw new Error(deleteTraceError(errorDetails));
         }
       }
     } catch (error: any) {
@@ -699,6 +749,86 @@ export class HellesClient {
         operation: 'deleteTrace',
         stage: failedStage,
         endpoint: '/traces/delete',
+        params: {
+          traceKey,
+          resolvedTraceKey: _traceKey,
+          normalizedTraceKey,
+          hasApiKey: Boolean(this.apiKey)
+        }
+      });
+    }
+  }
+
+  /**
+   * Creates a share link for a trace. Requires an API key configured in the constructor.
+   * The trace key will have the configured trace suffix appended automatically.
+   * @param params - Share parameters
+   * @param params.traceKey - The trace key to share
+   * @param params.onError - Optional error handler for this specific operation: (error, context) => void
+   * @returns The share response: { traceKey, shareKey, shareUrl }
+   */
+  async traceShare({
+    traceKey,
+    onError
+  }: {
+    traceKey: string;
+    onError?: HellesErrorHandler;
+  }): Promise<TraceShareResult | undefined> {
+    let failedStage = 'validate';
+    const _traceKey = this.applyTraceSuffix(traceKey);
+    const normalizedTraceKey = _traceKey.toUpperCase();
+
+    const traceShareError = (err: string) =>
+      formatHellesOpError('traceShare', err, { key: normalizedTraceKey });
+
+    try {
+      if (!this.apiKey) {
+        throw new Error(traceShareError('API key is required for traceShare'));
+      }
+
+      if (!traceKey) {
+        throw new Error(traceShareError('traceKey is required'));
+      }
+
+      try {
+        failedStage = 'postShare';
+        return await this.runWithSingleRetry(async () => {
+          const response = await this.requestWithBodyGuard(
+            `${this.hellesHost}/api/traces/${encodeURIComponent(normalizedTraceKey)}/share`,
+            {
+              method: 'POST',
+              headers: { Cookie: `apiKey=${this.apiKey}` }
+            }
+          );
+
+          if (response.statusCode >= 400) {
+            const errorBody: any = await response.body.json().catch(() => ({}));
+            if (typeof errorBody?.error === 'string') {
+              throw new Error(traceShareError(errorBody.error));
+            } else {
+              const errorDetails = errorBody ? wf_stringify(errorBody) : `HTTP ${response.statusCode}`;
+              throw new Error(traceShareError(errorDetails));
+            }
+          }
+
+          return (await response.body.json()) as TraceShareResult;
+        });
+      } catch (error: any) {
+        if (error.message?.startsWith('traceShare ')) {
+          throw error;
+        }
+        if (typeof error?.error === 'string') {
+          throw new Error(traceShareError(error.error));
+        } else {
+          const errorDetails = error.message || String(error);
+          throw new Error(traceShareError(errorDetails));
+        }
+      }
+    } catch (error: any) {
+      this.dispatchError(error, onError, {
+        operation: 'traceShare',
+        stage: failedStage,
+        endpoint: `/api/traces/${normalizedTraceKey}/share`,
         params: {
           traceKey,
           resolvedTraceKey: _traceKey,
