@@ -81,6 +81,26 @@ export type TraceFlowItem = {
   } | null;
 };
 
+type QueuedEvent = {
+  traceKey: string;
+  resolvedTraceKey: string;
+  eventType: string;
+  eventString?: string;
+  eventSender: string;
+  eventAttributes: Record<string, unknown>;
+  eventTimestampUtc: number;
+  eventUniquer?: string;
+  eventTypeLabel?: string;
+  eventTypeIcon?: string;
+  eventPermission?: string;
+  onError?: HellesErrorHandler;
+};
+
+type QueuedFlowUpsert = {
+  items: TraceFlowItem[];
+  onError?: HellesErrorHandler;
+};
+
 function formatHellesOpError(
   operation: string,
   err: string,
@@ -131,6 +151,14 @@ function traceFlowItemToServerRow(item: TraceFlowItem): Record<string, unknown> 
   };
 }
 
+function copyTraceFlowItem(item: TraceFlowItem): TraceFlowItem {
+  return {
+    ...item,
+    estimated: item.estimated != null ? { ...item.estimated } : item.estimated,
+    actual: item.actual != null ? { ...item.actual } : item.actual
+  };
+}
+
 const BASE_SYNC_INTERVAL_MS = 30_000;
 const BACKOFF_STEP_MS = 15_000;
 const MAX_SYNC_INTERVAL_MS = 180_000;
@@ -140,6 +168,10 @@ const MAX_NETWORK_ATTEMPTS = 2;
 /**
  * Client for interacting with the Helles tracing service.
  * Handles trace registration, event logging, time synchronization, and trace deletion.
+ *
+ * `logTraceEvent` and `upsertTraceFlows` enqueue work and return immediately; network I/O
+ * runs on a deferred flush. Call `flush()` to drain pending work (also runs automatically
+ * before `deleteTrace` / `traceShare`, and best-effort on `process.beforeExit`).
  */
 export class HellesClient {
   private hellesHost: string;
@@ -158,6 +190,11 @@ export class HellesClient {
     lastCheck: null,
     nextIntervalMs: BASE_SYNC_INTERVAL_MS
   };
+
+  private eventQueue: QueuedEvent[] = [];
+  private flowQueue: QueuedFlowUpsert[] = [];
+  private flushScheduled = false;
+  private activeFlush: Promise<void> | null = null;
 
   /**
    * Wraps undici request and installs a body error listener to prevent
@@ -266,6 +303,25 @@ export class HellesClient {
     this.defaults = config.defaults;
     this.registeredTraces = new Set();
     this.startTimeSync();
+    this.installBeforeExitHook();
+  }
+
+  private installBeforeExitHook(): void {
+    if (typeof process === 'undefined' || typeof process.on !== 'function') {
+      return;
+    }
+
+    process.on('beforeExit', () => {
+      if (
+        this.eventQueue.length === 0 &&
+        this.flowQueue.length === 0 &&
+        !this.activeFlush &&
+        !this.flushScheduled
+      ) {
+        return;
+      }
+      void this.flush();
+    });
   }
 
   /**
@@ -344,9 +400,10 @@ export class HellesClient {
         console.warn(`HellesClient ${phase} time sync failed: ${message}`);
         this.incrementBackoff();
       } finally {
-        setTimeout(() => {
+        const timer = setTimeout(() => {
           void sync(false);
         }, this.timeSync.nextIntervalMs);
+        timer.unref?.();
       }
     };
 
@@ -371,6 +428,7 @@ export class HellesClient {
   /**
    * Dispatches operation errors to local/global handlers with optional context.
    * If no handler exists, the error is rethrown.
+   * Used for synchronous validation on the caller turn.
    */
   private dispatchError(error: unknown, onError?: HellesErrorHandler, context?: HellesErrorContext): never | void {
     const normalized: HellesError =
@@ -390,8 +448,317 @@ export class HellesClient {
   }
 
   /**
+   * Reports flush-path errors. Calls onError / defaults.onError when present;
+   * otherwise console.warns and swallows (never throws, never rejects the caller).
+   */
+  private reportFlushError(
+    error: unknown,
+    onError?: HellesErrorHandler,
+    context?: HellesErrorContext
+  ): void {
+    const normalized: HellesError =
+      error instanceof Error ? (error as HellesError) : (new Error(String(error)) as HellesError);
+
+    if (context) {
+      normalized.hellesContext = context;
+    }
+
+    const handler = onError ?? this.defaults?.onError;
+    if (handler) {
+      try {
+        handler(normalized, context);
+      } catch (handlerError) {
+        console.warn(
+          'HellesClient onError handler threw:',
+          (handlerError as any)?.message ?? String(handlerError)
+        );
+      }
+      return;
+    }
+
+    console.warn(
+      `HellesClient ${context?.operation ?? 'flush'} failed (no onError handler): ${normalized.message}`
+    );
+  }
+
+  private scheduleFlush(): void {
+    if (this.flushScheduled) return;
+    this.flushScheduled = true;
+    setImmediate(() => {
+      this.flushScheduled = false;
+      void this.runFlush();
+    });
+  }
+
+  private runFlush(): Promise<void> {
+    if (this.activeFlush) {
+      return this.activeFlush.then(() => {
+        if (this.eventQueue.length > 0 || this.flowQueue.length > 0) {
+          return this.runFlush();
+        }
+      });
+    }
+
+    this.activeFlush = this.flushQueues().finally(() => {
+      this.activeFlush = null;
+    });
+
+    return this.activeFlush.then(() => {
+      if (this.eventQueue.length > 0 || this.flowQueue.length > 0) {
+        this.scheduleFlush();
+      }
+    });
+  }
+
+  /**
+   * Drains pending `logTraceEvent` / `upsertTraceFlows` work.
+   * Safe to call for tests, graceful shutdown, or before operations that must
+   * observe prior events (also invoked automatically before delete/share).
+   */
+  public async flush(): Promise<void> {
+    for (;;) {
+      if (this.activeFlush) {
+        await this.activeFlush;
+        continue;
+      }
+
+      if (this.eventQueue.length > 0 || this.flowQueue.length > 0) {
+        await this.runFlush();
+        continue;
+      }
+
+      if (this.flushScheduled) {
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        continue;
+      }
+
+      break;
+    }
+  }
+
+  private async flushQueues(): Promise<void> {
+    const events = this.eventQueue.splice(0, this.eventQueue.length);
+    const flows = this.flowQueue.splice(0, this.flowQueue.length);
+
+    for (const queued of events) {
+      await this.flushQueuedEvent(queued);
+    }
+
+    for (const queued of flows) {
+      await this.flushQueuedFlowUpsert(queued);
+    }
+  }
+
+  private async flushQueuedEvent(queued: QueuedEvent): Promise<void> {
+    const {
+      traceKey,
+      resolvedTraceKey,
+      eventType,
+      eventString,
+      eventSender,
+      eventAttributes,
+      eventTimestampUtc,
+      eventUniquer,
+      eventTypeLabel,
+      eventTypeIcon,
+      eventPermission,
+      onError
+    } = queued;
+
+    const logEventError = (err: string) =>
+      formatHellesOpError('logTraceEvent', err, { type: eventType, key: resolvedTraceKey });
+
+    const errorParams = {
+      traceKey,
+      resolvedTraceKey,
+      eventType,
+      eventString,
+      eventSender,
+      resolvedEventSender: eventSender,
+      eventTimestampUtc,
+      resolvedEventTimestampUtc: eventTimestampUtc,
+      eventUniquer,
+      eventTypeLabel,
+      eventTypeIcon,
+      eventPermission,
+      eventAttributesKeys:
+        eventAttributes && typeof eventAttributes === 'object'
+          ? Object.keys(eventAttributes)
+          : []
+    };
+
+    try {
+      if (!this.registeredTraces.has(resolvedTraceKey)) {
+        try {
+          const registerPayload = {
+            traceKey: resolvedTraceKey,
+            traceType: this.defaults.traceType ?? 'TRACE',
+            traceString: resolvedTraceKey
+          };
+
+          await this.runWithSingleRetry(async () => {
+            const response = await this.requestWithBodyGuard(`${this.hellesHost}/traces`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: wf_stringify(registerPayload)
+            });
+
+            if (response.statusCode >= 400) {
+              const errorBody = await response.body.json().catch(() => ({}));
+              const errorDetails = errorBody ? wf_stringify(errorBody) : `HTTP ${response.statusCode}`;
+              throw new Error(
+                formatHellesOpError('registerTrace', errorDetails, {
+                  type: eventType,
+                  key: resolvedTraceKey
+                })
+              );
+            }
+
+            await this.drainBody(response);
+          });
+        } catch (error: any) {
+          if (error.message?.startsWith('registerTrace ')) {
+            throw error;
+          }
+          const errorDetails = error.message || String(error);
+          throw new Error(
+            formatHellesOpError('registerTrace', errorDetails, {
+              type: eventType,
+              key: resolvedTraceKey
+            })
+          );
+        }
+
+        this.registeredTraces.add(resolvedTraceKey);
+      }
+
+      const postPayload: any = {
+        traceKey: resolvedTraceKey,
+        eventTypeKey: eventType,
+        eventString,
+        eventAttributes,
+        eventSender,
+        eventTimestampUtc,
+        eventUniquer
+      };
+
+      if (eventPermission !== undefined) {
+        postPayload.permission = eventPermission;
+      }
+
+      try {
+        await this.runWithSingleRetry(async () => {
+          const response = await this.requestWithBodyGuard(`${this.hellesHost}/events`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: wf_stringify(postPayload)
+          });
+
+          if (response.statusCode >= 400) {
+            const errorBody: any = await response.body.json().catch(() => ({}));
+            if (typeof errorBody?.error === 'string') {
+              throw new Error(logEventError(errorBody.error));
+            } else {
+              const errorDetails = errorBody ? wf_stringify(errorBody) : `HTTP ${response.statusCode}`;
+              throw new Error(logEventError(errorDetails));
+            }
+          }
+
+          await this.drainBody(response);
+        });
+      } catch (error: any) {
+        if (error.message?.startsWith('logTraceEvent ')) {
+          throw error;
+        }
+        if (typeof error?.error === 'string') {
+          throw new Error(logEventError(error.error));
+        } else {
+          const errorDetails = error.message || String(error);
+          throw new Error(logEventError(errorDetails));
+        }
+      }
+    } catch (error: any) {
+      const stage = typeof error?.message === 'string' && error.message.startsWith('registerTrace ')
+        ? 'registerTrace'
+        : 'postEvent';
+
+      this.reportFlushError(error, onError, {
+        operation: 'logTraceEvent',
+        stage,
+        endpoint: stage === 'registerTrace' ? '/traces' : '/events',
+        params: errorParams
+      });
+    }
+  }
+
+  private async flushQueuedFlowUpsert(queued: QueuedFlowUpsert): Promise<void> {
+    const { items, onError } = queued;
+
+    try {
+      const payload = items.map((item) => {
+        const rawTraceKey = item.tracekey != null ? String(item.tracekey) : null;
+        const tracekey = rawTraceKey ? this.applyTraceSuffix(rawTraceKey).toUpperCase() : null;
+        const flow_key = item.flow_key != null ? String(item.flow_key) : null;
+        const row = traceFlowItemToServerRow(item);
+        return { ...row, tracekey, flow_key };
+      });
+      const upsertTraceKeys = [
+        ...new Set(
+          payload
+            .map((row) => row.tracekey)
+            .filter((tracekey): tracekey is string => tracekey != null && tracekey !== '')
+        )
+      ].join(',');
+
+      const upsertFlowError = (err: string) =>
+        formatHellesOpError('upsertTraceFlows', err, { key: upsertTraceKeys || undefined });
+
+      await this.runWithSingleRetry(async () => {
+        const response = await this.requestWithBodyGuard(`${this.hellesHost}/api/trace-flows/upsert`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: wf_stringify({ items: payload })
+        });
+
+        if (response.statusCode >= 400) {
+          const errorBody: any = await response.body.json().catch(() => ({}));
+          if (typeof errorBody?.error === 'string') {
+            throw new Error(upsertFlowError(errorBody.error));
+          } else {
+            const errorDetails = errorBody ? wf_stringify(errorBody) : `HTTP ${response.statusCode}`;
+            throw new Error(upsertFlowError(errorDetails));
+          }
+        }
+
+        await this.drainBody(response);
+      });
+    } catch (error: any) {
+      this.reportFlushError(error, onError, {
+        operation: 'upsertTraceFlows',
+        stage: 'postUpsert',
+        endpoint: '/api/trace-flows/upsert',
+        params: {
+          itemsCount: Array.isArray(items) ? items.length : 0,
+          sample: Array.isArray(items) && items[0]
+            ? { tracekey: items[0].tracekey, flow_key: items[0].flow_key }
+            : null
+        }
+      });
+    }
+  }
+
+  /**
    * Logs an event to a trace. Automatically registers the trace if it hasn't been registered yet.
    * The trace key will have the configured trace suffix appended automatically.
+   *
+   * Enqueues the event and returns immediately (resolved Promise). Network I/O runs on a
+   * deferred flush. Timestamps are captured at call time. Happy-path return value is always
+   * `undefined` (server body is not returned). Flush failures go to onError / defaults.onError,
+   * or are console.warn'd when no handler is set — they never reject this Promise.
+   *
+   * Sync validation failures (missing sender, bad timestamp) still use throw-or-onError on
+   * the caller turn.
+   *
    * @param params - Event parameters
    * @param params.traceKey - The trace key to log the event to EG: "deposit_1234567"
    * @param params.eventType - Type identifier for the event EG: "NOTE"
@@ -404,7 +771,7 @@ export class HellesClient {
    * @param params.eventTypeIcon - Optional overriding icon for the event type EG: "🎯"
    * @param params.eventPermission - Optional permission identifier for this event
    * @param params.onError - Optional error handler function: (error, context) => void
-   * @returns The response data from the Helles server
+   * @returns Always resolves to undefined on the happy path (after enqueue)
    */
   async logTraceEvent({
     traceKey,
@@ -430,15 +797,15 @@ export class HellesClient {
     eventTypeIcon?: string;
     eventPermission?: string;
     onError?: HellesErrorHandler;
-  }): Promise<any> {
-    let failedStage = 'validate';
+  }): Promise<undefined> {
     const _traceKey = this.applyTraceSuffix(traceKey);
     let _eventTimestampUtc: number | undefined;
     let _eventSender: string | undefined;
 
     try {
-      if (eventTypeLabel) eventAttributes.eventTypeLabel = eventTypeLabel;
-      if (eventTypeIcon) eventAttributes.eventTypeIcon = eventTypeIcon;
+      const attrs: Record<string, unknown> = { ...(eventAttributes ?? {}) };
+      if (eventTypeLabel) attrs.eventTypeLabel = eventTypeLabel;
+      if (eventTypeIcon) attrs.eventTypeIcon = eventTypeIcon;
 
       const defaultTimestamp = this.defaults?.eventTimestampFunc?.() ?? this.now();
       _eventTimestampUtc =
@@ -466,101 +833,26 @@ export class HellesClient {
         throw new Error(logEventError('eventSender is required'));
       }
 
-      // only register trace if it hasn't been registered yet
-      if (!this.registeredTraces.has(_traceKey)) {
-        failedStage = 'registerTrace';
-        try {
-          const registerPayload = {
-            traceKey: _traceKey,
-            traceType: this.defaults.traceType ?? 'TRACE',
-            traceString: _traceKey
-          };
-
-          await this.runWithSingleRetry(async () => {
-            const response = await this.requestWithBodyGuard(`${this.hellesHost}/traces`, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: wf_stringify(registerPayload)
-            });
-
-            if (response.statusCode >= 400) {
-              const errorBody = await response.body.json().catch(() => ({}));
-              const errorDetails = errorBody ? wf_stringify(errorBody) : `HTTP ${response.statusCode}`;
-              throw new Error(
-                formatHellesOpError('registerTrace', errorDetails, { type: eventType, key: _traceKey })
-              );
-            }
-
-            await this.drainBody(response);
-          });
-        } catch (error: any) {
-          if (error.message?.startsWith('registerTrace ')) {
-            throw error;
-          }
-          const errorDetails = error.message || String(error);
-          throw new Error(
-            formatHellesOpError('registerTrace', errorDetails, { type: eventType, key: _traceKey })
-          );
-        }
-
-        this.registeredTraces.add(_traceKey);
-      }
-
-      failedStage = 'postEvent';
-      const postPayload: any = {
-        traceKey: _traceKey,
-        eventTypeKey: eventType,
+      this.eventQueue.push({
+        traceKey,
+        resolvedTraceKey: _traceKey,
+        eventType,
         eventString,
-        eventAttributes,
         eventSender: _eventSender,
+        eventAttributes: attrs,
         eventTimestampUtc: _eventTimestampUtc,
-        eventUniquer
-      };
-
-      if (eventPermission !== undefined) {
-        postPayload.permission = eventPermission;
-      }
-
-      try {
-        return await this.runWithSingleRetry(async () => {
-          const response = await this.requestWithBodyGuard(`${this.hellesHost}/events`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: wf_stringify(postPayload)
-          });
-
-          if (response.statusCode >= 400) {
-            const errorBody: any = await response.body.json().catch(() => ({}));
-            if (typeof errorBody?.error === 'string') {
-              throw new Error(logEventError(errorBody.error));
-            } else {
-              const errorDetails = errorBody ? wf_stringify(errorBody) : `HTTP ${response.statusCode}`;
-              throw new Error(logEventError(errorDetails));
-            }
-          }
-
-          return await response.body.json();
-        });
-      } catch (error: any) {
-        if (error.message?.startsWith('logTraceEvent ')) {
-          throw error;
-        }
-        if (typeof error?.error === 'string') {
-          throw new Error(logEventError(error.error));
-        } else {
-          const errorDetails = error.message || String(error);
-          throw new Error(logEventError(errorDetails));
-        }
-      }
+        eventUniquer,
+        eventTypeLabel,
+        eventTypeIcon,
+        eventPermission,
+        onError
+      });
+      this.scheduleFlush();
+      return undefined;
     } catch (error: any) {
       this.dispatchError(error, onError, {
         operation: 'logTraceEvent',
-        stage: failedStage,
-        endpoint: failedStage === 'registerTrace'
-          ? '/traces'
-          : failedStage === 'postEvent'
-            ? '/events'
-            : undefined,
+        stage: 'validate',
         params: {
           traceKey,
           resolvedTraceKey: _traceKey,
@@ -589,20 +881,14 @@ export class HellesClient {
    * tracekey or flow_key are skipped (counted in response.skipped). Optional idempotency values allow
    * the server to ignore older duplicates.
    *
+   * Enqueues the upsert and returns immediately. Network I/O runs on a deferred flush.
+   * Happy-path return value is always `undefined` (server `{ accepted, skipped }` is not returned).
+   * Flush failures go to onError / defaults.onError, or are console.warn'd when no handler is set.
+   *
    * @param params - Upsert parameters
    * @param params.items - Array of trace flow items to upsert. Each item must include tracekey and flow_key; other fields are optional. Use order, type, chainid, asset_label at top level; estimated and actual in nested objects.
-   * @param params.items[].tracekey - Trace key (required). Normalized to uppercase on the server.
-   * @param params.items[].flow_key - Flow key (required). Unique per trace.
-   * @param params.items[].idempotency - Optional numeric idempotency value; lower values for the same (tracekey, flow_key) are ignored.
-   * @param params.items[].order - Optional order of the flow within the trace.
-   * @param params.items[].type - Optional type/category of the flow.
-   * @param params.items[].chainid - Optional chain identifier.
-   * @param params.items[].asset_label - Optional asset label.
-   * @param params.items[].asset_decimals - Optional asset decimals (integer).
-   * @param params.items[].estimated - Optional object: units, raw, usd, unitsapprox, timestamp.
-   * @param params.items[].actual - Optional object: units, raw, usd, unitsapprox, timestamp, hash, entity.
    * @param params.onError - Optional error handler for this call: (error, context) => void
-   * @returns The response from the Helles server: { accepted: number, skipped: number }, or undefined if onError handled the error.
+   * @returns Always resolves to undefined on the happy path (after enqueue)
    */
   async upsertTraceFlows({
     items,
@@ -610,56 +896,22 @@ export class HellesClient {
   }: {
     items: TraceFlowItem[];
     onError?: HellesErrorHandler;
-  }): Promise<{ accepted: number; skipped: number } | undefined> {
-    let failedStage = 'validate';
+  }): Promise<undefined> {
     try {
       if (!Array.isArray(items) || items.length === 0) {
         throw new Error('items array is required and must be non-empty');
       }
 
-      failedStage = 'postUpsert';
-      const payload = items.map((item) => {
-        const rawTraceKey = item.tracekey != null ? String(item.tracekey) : null;
-        const tracekey = rawTraceKey ? this.applyTraceSuffix(rawTraceKey).toUpperCase() : null;
-        const flow_key = item.flow_key != null ? String(item.flow_key) : null;
-        const row = traceFlowItemToServerRow(item);
-        return { ...row, tracekey, flow_key };
+      this.flowQueue.push({
+        items: items.map(copyTraceFlowItem),
+        onError
       });
-      const upsertTraceKeys = [
-        ...new Set(
-          payload
-            .map((row) => row.tracekey)
-            .filter((tracekey): tracekey is string => tracekey != null && tracekey !== '')
-        )
-      ].join(',');
-
-      const upsertFlowError = (err: string) =>
-        formatHellesOpError('upsertTraceFlows', err, { key: upsertTraceKeys || undefined });
-
-      return await this.runWithSingleRetry(async () => {
-        const response = await this.requestWithBodyGuard(`${this.hellesHost}/api/trace-flows/upsert`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: wf_stringify({ items: payload })
-        });
-
-        if (response.statusCode >= 400) {
-          const errorBody: any = await response.body.json().catch(() => ({}));
-          if (typeof errorBody?.error === 'string') {
-            throw new Error(upsertFlowError(errorBody.error));
-          } else {
-            const errorDetails = errorBody ? wf_stringify(errorBody) : `HTTP ${response.statusCode}`;
-            throw new Error(upsertFlowError(errorDetails));
-          }
-        }
-
-        const result = (await response.body.json()) as { accepted: number; skipped: number };
-        return result;
-      });
+      this.scheduleFlush();
+      return undefined;
     } catch (error: any) {
       this.dispatchError(error, onError, {
         operation: 'upsertTraceFlows',
-        stage: failedStage,
+        stage: 'validate',
         endpoint: '/api/trace-flows/upsert',
         params: {
           itemsCount: Array.isArray(items) ? items.length : 0,
@@ -673,6 +925,7 @@ export class HellesClient {
 
   /**
    * Deletes a trace from the Helles server.
+   * Flushes pending events/flows first so delete cannot race ahead of deferred posts.
    * The trace key will have the configured trace suffix appended automatically.
    * Requires an API key to be configured in the constructor.
    * @param params - Delete parameters
@@ -687,6 +940,8 @@ export class HellesClient {
     traceKey: string;
     onError?: HellesErrorHandler;
   }): Promise<any> {
+    await this.flush();
+
     let failedStage = 'validate';
     const _traceKey = this.applyTraceSuffix(traceKey);
     const normalizedTraceKey = _traceKey.toUpperCase();
@@ -761,6 +1016,7 @@ export class HellesClient {
 
   /**
    * Creates a share link for a trace. Requires an API key configured in the constructor.
+   * Flushes pending events/flows first so share cannot race ahead of deferred posts.
    * The trace key will have the configured trace suffix appended automatically.
    * @param params - Share parameters
    * @param params.traceKey - The trace key to share
@@ -774,6 +1030,8 @@ export class HellesClient {
     traceKey: string;
     onError?: HellesErrorHandler;
   }): Promise<TraceShareResult | undefined> {
+    await this.flush();
+
     let failedStage = 'validate';
     const _traceKey = this.applyTraceSuffix(traceKey);
     const normalizedTraceKey = _traceKey.toUpperCase();
@@ -839,4 +1097,3 @@ export class HellesClient {
     }
   }
 }
-

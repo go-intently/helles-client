@@ -16,6 +16,7 @@ yarn add helles-client
 
 - Automatic time synchronization with Helles server
 - Automatic trace registration on first event
+- Deferred (non-blocking) event / flow logging with call-time timestamps
 - Event logging with deduplication support
 - Trace deletion (requires API key)
 - BigInt serialization support
@@ -102,9 +103,13 @@ const syncState = client.getTimeSync();
 // Returns: { latency: number | null, offset: number, lastCheck: number | null, nextIntervalMs: number }
 ```
 
-##### `logTraceEvent(params): Promise<any>`
+##### `logTraceEvent(params): Promise<undefined>`
 
-Logs an event to a trace. Automatically registers the trace if it hasn't been registered yet.
+Enqueues an event and returns immediately. Automatically registers the trace on first flush if needed.
+
+Timestamps are captured at call time (`eventTimestampUtc` / `eventTimestampFunc` / `now()`), so deferred flush does not shift event times. Caller `eventAttributes` are shallow-copied (label/icon applied on the copy).
+
+Happy-path return is always `undefined` (server body is not returned). Network/register failures are reported via `onError` / `defaults.onError`, or `console.warn`'d when no handler is set — they never reject this Promise. Sync validation failures (missing sender, bad timestamp) still throw-or-`onError` on the caller turn.
 
 ```typescript
 await client.logTraceEvent({
@@ -120,6 +125,14 @@ await client.logTraceEvent({
   onError?: (error: any, context?: HellesErrorContext) => void; // Optional: error handler for this call
 });
 ```
+
+##### `upsertTraceFlows(params): Promise<undefined>`
+
+Enqueues a flow upsert and returns immediately (same deferred-flush model as `logTraceEvent`). Items are shallow-copied (including nested `estimated` / `actual`). Happy-path return is always `undefined`.
+
+##### `flush(): Promise<void>`
+
+Drains pending `logTraceEvent` / `upsertTraceFlows` work. Use in tests and graceful shutdown. Also runs automatically before `deleteTrace` / `traceShare`, and best-effort on `process.beforeExit`. Hard kills (`kill -9`) can still drop the queue — call `flush()` in graceful shutdown paths.
 
 #### "NOTE" event type
 
@@ -146,16 +159,27 @@ await client.deleteTrace({
 
 The client automatically synchronizes time with the Helles server on startup and continues syncing at regular intervals. This ensures event timestamps are precise and accurate even when the client's system clock disagrees with that of the helles server.
 
+## Deferred logging
+
+`logTraceEvent` and `upsertTraceFlows` are enqueue-and-return: validate + queue + schedule flush on the caller turn; JSON/HTTP/retries run later via `setImmediate`. Existing `await client.logTraceEvent(...)` call sites keep working, but `await` no longer waits for the network.
+
+- Prefer `defaults.onError` (or per-call `onError`) so flush failures are visible.
+- No handler ⇒ flush failures are warned, not thrown.
+- `deleteTrace` / `traceShare` auto-`flush()` first so they cannot race ahead of pending posts.
+
 ## Error Handling
 
-Errors can be handled globally via `defaults.onError` in the constructor, or per-operation via the `onError` parameter in method calls. If no error handler is provided, errors are thrown.
+Errors can be handled globally via `defaults.onError` in the constructor, or per-operation via the `onError` parameter in method calls.
+
+- **Caller-turn validation** (missing sender, bad timestamp, empty upsert items): if no handler is provided, errors are thrown.
+- **Flush-path network/register failures**: if no handler is provided, errors are `console.warn`'d and swallowed (never thrown into the caller).
 
 Both handlers receive a second argument with failure context:
 
 ```typescript
 onError(error, context) {
   console.error(error.message);
-  console.error(context?.operation); // "logTraceEvent" | "upsertTraceFlows" | "deleteTrace"
+  console.error(context?.operation); // "logTraceEvent" | "upsertTraceFlows" | "deleteTrace" | "traceShare"
   console.error(context?.stage);     // e.g. "validate", "registerTrace", "postEvent"
   console.error(context?.params);    // sanitized call parameters for troubleshooting
 }
